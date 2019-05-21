@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Scheduled Lambda Tasks
+Parameters:
+  OAuthToken:
+    Type: String
+    NoEcho: true
+    Description: The Slack API OAuth Token
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowLambdaLogging
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+  ScheduledTasksLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        # Required slack permissions
+        # dnd:write
+        # dnd:read
+        # users.profile.write
+        # users.profile.read
+        # users.read
+
+        # M  Long day in SF        6:00am 6:35am - 5:40pm 6:15pm = 11:45
+        # T  Short day in Alameda  7:00am - 10:00am = 3                 
+        # W  Normal day in Alameda 7:00am - 5:00pm = 10                 
+        # Th Short day in Alameda  7:00am - 10:00am = 3                 
+        # F  Long day in SF        6:00am 6:35am - 5:40pm 6:15pm = 11:45
+
+        # TODO
+        # Add Google calendar item for going to work next
+        # Set working hours in work Google Calendar
+        ZipFile: |
+          from botocore.vendored import requests
+          from datetime import datetime, timedelta
+          from dateutil import tz
+          import os, json, logging
+
+          TIME_ZONE = tz.gettz('America/Los_Angeles')
+          OAUTH_TOKEN = os.getenv('OAUTH_TOKEN')
+          SCHEDULE_MAP = json.loads(os.getenv('SCHEDULE_MAP'))
+
+
+          def pst_time(secs):
+              utc = datetime.fromtimestamp(secs)
+              utc = utc.replace(tzinfo=tz.gettz('UTC'))
+              pst = utc.astimezone(TIME_ZONE)
+              return pst.timetuple()
+
+
+          logger = logging.getLogger(__name__)
+          if len(logging.getLogger().handlers) == 0:
+              logger.addHandler(logging.StreamHandler())
+          else:
+              fmt = "[%(levelname)s] %(asctime)s %(message)s\n"
+              datefmt = "%m/%d/%Y %H:%M:%S {}".format(TIME_ZONE.tzname(datetime.now()))
+              formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+              formatter.converter = pst_time
+              logging.getLogger().handlers[0].setFormatter(formatter)
+
+          logging.getLogger().setLevel(logging.DEBUG)
+          NOW = datetime.now().replace(tzinfo=tz.gettz('UTC')).astimezone(TIME_ZONE)
+
+
+          class TaskManager:
+              def __init__(self):
+                  self.headers = {'Authorization': 'Bearer %s' % OAUTH_TOKEN}
+
+              def get(self, *args, **kwargs):
+                  return requests.get(*args, headers=self.headers, **kwargs)
+
+              def post(self, *args, **kwargs):
+                  return requests.post(*args, headers=self.headers, **kwargs)
+
+              def work(self):
+                  # Clear do not disturb
+                  response = self.get('https://slack.com/api/dnd.info')
+                  if response.json()['dnd_enabled']:
+                      self.get('https://slack.com/api/dnd.endSnooze')
+
+                  # Change presence from away to auto
+                  response = self.get('https://slack.com/api/users.getPresence')
+                  if response.json()['presence'] == 'away':
+                      self.post(
+                          'https://slack.com/api/users.setPresence',
+                          json={'presence': 'auto'})
+
+                  # Clear status
+                  response = self.get('https://slack.com/api/users.profile.get')
+                  if response.json()['profile']['status_text'].startswith('Away'):
+                      self.post(
+                          'https://slack.com/api/users.profile.set',
+                          json={'profile': {'status_text': '', 'status_emoji': ''}})
+
+              def go_home(self, num_minutes, status_emoji):
+                  status_expiration = NOW + timedelta(minutes=num_minutes)
+                  status_text = 'Away, back online {} at {}'.format(
+                      status_expiration.strftime('%a'),
+                      status_expiration.strftime('%-I:%M%p')
+                  )
+
+                  # Set do not disturb
+                  self.get(
+                      'https://slack.com/api/dnd.setSnooze',
+                      params={'num_minutes': num_minutes})
+
+                  # Change presence to away
+                  self.post(
+                      'https://slack.com/api/users.setPresence',
+                      json={'presence': 'away'})
+
+                  # Set status
+                  self.post(
+                      'https://slack.com/api/users.profile.set',
+                      json={'profile': {
+                              'status_text': status_text,
+                              'status_emoji': status_emoji,
+                              'status_expiration': int(status_expiration.timestamp())}})
+
+
+          def lambda_handler(event, context):
+              task_manager = TaskManager()
+              day = int(NOW.strftime('%w'))
+              for schedule in SCHEDULE_MAP:
+                  if schedule['day_time'][0] != day:
+                      logger.debug('Schedule is the wrong day : {}'.format(day))
+                      continue  # Wrong day
+                  delta = NOW - NOW.replace(
+                      hour=schedule['day_time'][1], minute=schedule['day_time'][2])
+                  if abs(delta.total_seconds()) > 20:
+                      logger.debug('Schedule is the wrong time : {} is {} away'.format(
+                          NOW, delta))
+                      continue  # Wrong time
+                  logger.info('Launching {}'.format(schedule['action']))
+                  func = getattr(task_manager, schedule['action'])
+                  return func(**schedule.get('args', {}))
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          SCHEDULE_MAP: '[{"action": "work", "day_time": [1, 6, 0]}, {"action": "go_home", "day_time": [1, 18, 15], "args": {"num_minutes": 765, "status_emoji": ":clock7:"}}, {"action": "work", "day_time": [2, 7, 0]}, {"action": "go_home", "day_time": [2, 10, 0], "args": {"num_minutes": 1260, "status_emoji": ":clock7:"}}, {"action": "work", "day_time": [3, 7, 0]}, {"action": "go_home", "day_time": [3, 17, 0], "args": {"num_minutes": 840, "status_emoji": ":clock7:"}}, {"action": "work", "day_time": [4, 7, 0]}, {"action": "go_home", "day_time": [4, 10, 0], "args": {"num_minutes": 1200, "status_emoji": ":clock6:"}}, {"action": "work", "day_time": [5, 6, 0]}, {"action": "go_home", "day_time": [5, 18, 15], "args": {"num_minutes": 3585, "status_emoji": ":clock6:"}}]'
+          OAUTH_TOKEN: !Ref OAuthToken
+      Runtime: python3.7
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 20
+  Rule1:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Run Lambda Scheduled Tasks
+      ScheduleExpression: cron(0 6 ? * MON,FRI *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledTasksLambdaFunction.Arn
+          Id: RunLambdaScheduledTasks
+  Rule2:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Run Lambda Scheduled Tasks
+      ScheduleExpression: cron(15 18 ? * MON,FRI *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledTasksLambdaFunction.Arn
+          Id: RunLambdaScheduledTasks
+  Rule3:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Run Lambda Scheduled Tasks
+      ScheduleExpression: cron(0 7,10 ? * TUE,THU *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledTasksLambdaFunction.Arn
+          Id: RunLambdaScheduledTasks
+  Rule4:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Run Lambda Scheduled Tasks
+      ScheduleExpression: cron(0 7,17 ? * WED *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScheduledTasksLambdaFunction.Arn
+          Id: RunLambdaScheduledTasks
