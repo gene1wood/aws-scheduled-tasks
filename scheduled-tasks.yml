@@ -93,7 +93,7 @@ Resources:
                   # Clear do not disturb
                   response = self.get('https://slack.com/api/dnd.info')
                   if response.json()['dnd_enabled']:
-                      self.get('https://slack.com/api/dnd.endSnooze')
+                      self.post('https://slack.com/api/dnd.endSnooze')
 
                   # Change presence from away to auto
                   response = self.get('https://slack.com/api/users.getPresence')
